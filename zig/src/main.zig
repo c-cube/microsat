@@ -1,5 +1,6 @@
 const std = @import("std");
 const c = @cImport({
+    @cInclude("stdlib.h");
     @cInclude("stdio.h");
 });
 
@@ -13,6 +14,15 @@ fn abs(i: var) @typeof(-i) {
     return if (i > 0) i else -i;
 }
 
+const V32 = struct {
+    ptr: [*c]i32,
+    const Self = @This();
+
+    fn get(self: *Self, idx: i32) *i32 {
+        return @intToPtr(*i32, @intCast(usize, @intCast(isize, @ptrToInt(self.ptr)) + @intCast(isize, idx)));
+    }
+};
+
 const Solver = struct {
     DB: [*c]i32, // main memory bank
     nVars: i32,
@@ -25,15 +35,15 @@ const Solver = struct {
     buffer: [*c]i32,
     nConflicts: usize,
     model: [*c]i32,
-    reason: [*c]i32,
+    reason: V32,
     falseStack: [*c]i32,
-    false_: [*c]i32,
-    first: [*c]i32,
+    false_: V32,
+    first: V32,
     forced: [*c]i32,
     processed: [*c]i32,
     assigned: [*c]i32,
-    next: [*c]i32,
-    prev: [*c]i32,
+    next: V32,
+    prev: V32,
     head: usize,
     res: usize,
     fast: usize,
@@ -53,35 +63,34 @@ fn restart(S: *Solver) void {
 }
 pub fn assign(S: *Solver, reason: [*c]i32, forced: i32) void {
     const lit: i32 = reason[0];
-    S.false_[-lit] = if (forced) IMPLIED else 1;
+    S.false_.get(-lit).* = if (forced != 0) IMPLIED else 1;
     S.assigned.* = -lit;
     S.assigned += 1;
     S.reason[abs(lit)] = 1 + i32(reason - S.DB);
-    S.model[abs(lit)] = (lit > 0);
+    S.model[@intCast(usize, abs(lit))] = (lit > 0);
 }
 pub fn addWatch(S: *Solver, lit: i32, mem: i32) void {
     S.DB[mem] = S.first[lit];
     S.first[lit] = mem;
 }
-pub fn getMemory(S: *Solver, mem_size: i32) [*c]i32 {
+pub fn getMemory(S: *Solver, mem_size: usize) [*c]i32 {
     if ((S.mem_used + mem_size) > S.mem_max) {
         _ = c.printf(c"c out of memory\n");
-        exit(0);
+        c.exit(0);
     }
-    var store: [*c]i32 = S.DB +% S.mem_used;
+    var store: [*c]i32 = S.DB + S.mem_used;
     S.mem_used += mem_size;
     return store;
 }
-pub fn addClause(S: *Solver, in: [*c]i32, size: i32, irr: i32) [*c]i32 {
-    var i: i32 = undefined;
-    var used: i32 = S.mem_used;
-    var clause: [*c]i32 = getMemory(S, size + 3) +% 2;
+pub fn addClause(S: *Solver, in: [*c]i32, size: usize, irr: i32) [*c]i32 {
+    var i: usize = undefined;
+    var used: i32 = @intCast(i32, S.mem_used);
+    var clause: [*c]i32 = getMemory(S, size + 3) + 2;
     if (size > 1) {
         addWatch(S, in[0], used);
         addWatch(S, in[1], used + 1);
     }
     {
-        i = 0;
         while (i < size) : (i += 1) clause[i] = in[i];
     }
     clause[i] = 0;
@@ -135,13 +144,13 @@ pub fn reduceDB(S: *Solver, k: i32) void {
 pub fn bump(S: *Solver, lit: i32) void {
     if (S.false_[lit] != IMPLIED) {
         S.false_[lit] = MARK;
-        var @"var": i32 = abs(lit);
-        if (@"var" != S.head) {
-            S.prev[S.next[@"var"]] = S.prev[@"var"];
-            S.next[S.prev[@"var"]] = S.next[@"var"];
-            S.next[S.head] = @"var";
-            S.prev[@"var"] = S.head;
-            S.head = @"var";
+        var var_: i32 = abs(lit);
+        if (var_ != S.head) {
+            S.prev[S.next[var_]] = S.prev[var_];
+            S.next[S.prev[var_]] = S.next[var_];
+            S.next[S.head] = var_;
+            S.prev[var_] = S.head;
+            S.head = var_;
         }
     }
 }
@@ -153,9 +162,11 @@ pub fn implied(S: *Solver, lit: i32) i32 {
         const _ref = &p;
         _ref.* +%= 1;
         break :x _ref.*;
-    }).* != 0) if ((S.false_[p.*] ^ MARK) and (!(implied(S, p.*) != 0))) {
+    }).* != 0) {
+    if ((S.false_[p.*] ^ MARK) and (!(implied(S, p.*) != 0))) {
         S.false_[lit] = (IMPLIED - 1);
         return 0;
+    }
     };
     S.false_[lit] = IMPLIED;
     return 1;
@@ -194,7 +205,7 @@ pub fn propagate(S: *Solver) i32 {
                 if (!(S.false_[clause[0]] != 0)) {
                     assign(S, clause, forced);
                 } else {
-                    if (forced != 0) return .UNSAT;
+                    if (forced != 0) return UNSAT;
                     var lemma: [*c]i32 = analyze(S, clause);
                     if (!(lemma[1] != 0)) forced = 1;
                     assign(S, lemma, forced);
@@ -239,7 +250,7 @@ pub fn solve(S: *Solver) i32 {
 }
 
 fn mkSolver(alloc: *std.mem.Allocator, n_: i32, m: i32) !*Solver {
-    var n = if (n_ < 1) 1 else n_;
+    const n = if (n_ < 1) 1 else n_;
     const S = try alloc.create(Solver);
     S.nVars = n;
     S.nClauses = m;
@@ -251,44 +262,34 @@ fn mkSolver(alloc: *std.mem.Allocator, n_: i32, m: i32) !*Solver {
     S.slow = 1 << 24;
     S.fast = 1 << 24;
     S.DB = @ptrCast([*c]i32, (try alloc.alloc(i32, S.mem_max)).ptr);
-    S.model = getMemory(S, n + 1);
-    S.next = getMemory(S, n + 1);
-    S.prev = getMemory(S, n + 1);
-    S.buffer = getMemory(S, n);
-    S.reason = getMemory(S, n + 1);
-    S.falseStack = getMemory(S, n + 1);
+    const nUsize = @intCast(usize, n);
+    S.model = getMemory(S, nUsize + 1);
+    S.next = V32{ .ptr = getMemory(S, nUsize + 1) };
+    S.prev = V32{ .ptr = getMemory(S, nUsize + 1) };
+    S.buffer = getMemory(S, nUsize);
+    S.reason = V32{ .ptr = getMemory(S, nUsize + 1) };
+    S.falseStack = getMemory(S, nUsize + 1);
     S.forced = S.falseStack;
     S.processed = S.falseStack;
     S.assigned = S.falseStack;
-    S.false_ = getMemory(S, (2 * n) + 1);
-    S.false_ += n;
-    S.first = getMemory(S, (2 * n) + 1);
-    S.first += n;
-    S.status = .SAT;
+    S.false_ = V32{ .ptr = getMemory(S, (2 * nUsize) + 1) + nUsize };
+    S.first = V32{ .ptr = getMemory(S, (2 * nUsize) + 1) + nUsize };
+    S.status = SAT;
     S.DB[S.mem_used] = 0;
     S.mem_used += 1;
     {
         var i: i32 = 1;
         while (i <= n) : (i += 1) {
-            S.prev[i] = (i - 1);
-            S.next[i - 1] = i;
-            S.model[i] = (x: {
-                const _tmp = (x: {
-                    const _tmp = 0;
-                    S.false_[i] = _tmp;
-                    break :x _tmp;
-                });
-                S.false_[-i] = _tmp;
-                break :x _tmp;
-            });
-            S.first[i] = (x: {
-                const _tmp = END;
-                S.first[-i] = _tmp;
-                break :x _tmp;
-            });
+            S.prev.get(i).* = (i - 1);
+            S.next.get(i - 1).* = i;
+            S.false_.get(i).* = 0;
+            S.false_.get(-i).* = 0;
+            S.model[@intCast(usize, i)] = 0;
+            S.first.get(i).* = END;
+            S.first.get(-i).* = END;
         }
     }
-    S.head = n;
+    S.head = @intCast(usize, n);
     return S;
 }
 
@@ -310,23 +311,20 @@ pub fn parse(alloc: *std.mem.Allocator, filename: [*c]u8) !*Solver {
         var lit: i32 = 0;
         tmp = c.fscanf(input, c" %i ", &lit);
         if (!(lit != 0)) {
-            var clause: [*c]i32 = addClause(S, S.buffer, size, 1);
-            if ((!(size != 0)) or ((size == 1) and (S.false_[clause[0]] != 0))) {
+            var clause: [*c]i32 = addClause(S, S.buffer, @intCast(usize, size), 1);
+            if ((!(size != 0)) or ((size == 1) and (S.false_.get(clause[0]).* != 0))) {
                 S.status = UNSAT;
                 return S;
             }
-            if ((size == 1) and (!(S.false_[-clause[0]] != 0))) {
+            if ((size == 1) and (!(S.false_.get(-clause[0]).* != 0))) {
                 assign(S, clause, 1);
             }
             size = 0;
             nZeros -= 1;
-        } else
-            S.buffer[(x: {
-            const _ref = &size;
-            const _tmp = _ref.*;
-            _ref.* += 1;
-            break :x _tmp;
-        })] = lit;
+        } else {
+            S.buffer[@intCast(usize, size)] = lit;
+            size += 1;
+        }
     }
     _ = c.fclose(input);
     S.status = SAT;
@@ -335,12 +333,12 @@ pub fn parse(alloc: *std.mem.Allocator, filename: [*c]u8) !*Solver {
 
 pub export fn main(argc: i32, argv: [*c][*c]u8) void {
     const S: *Solver = parse(std.heap.c_allocator, argv[1]) catch {
-        c.printf("error\n");
+        _ = c.printf(c"error\n");
         c.exit(0);
     };
-    if (S.status == .UNSAT) {
+    if (S.status == UNSAT) {
         _ = c.printf(c"s UNSATISFIABLE\n");
-    } else if (S.solve() == .UNSAT) {
+    } else if (solve(S) == UNSAT) {
         _ = c.printf(c"s UNSATISFIABLE\n");
     } else {
         _ = c.printf(c"s SATISFIABLE\n");
