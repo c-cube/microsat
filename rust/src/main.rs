@@ -1,139 +1,183 @@
-use std::{alloc, io, marker::PhantomData, ptr, vec::Vec};
+use std::{io, marker::PhantomData, u32, usize, vec::Vec};
 
-enum R {
+#[derive(Debug, Clone, Copy)]
+pub enum R {
     Sat,
     Unsat,
 }
 
-#[repr(i32)]
-enum Tags {
-    End = -9,
-    Mark = 2,
-    Implied = 6,
+/// Boolean variable
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct Var(u32);
+
+/// Boolean literal
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub struct Lit(u32);
+
+/// Normalize literal from a signed integer (e.g. from dimacs).
+fn norm_lit(i: i32) -> usize {
+    (i.abs() as usize) << 1 | ((i > 0) as usize)
 }
 
-/// A raw pointer with indexing, for all the delicious unsafety of C
-#[derive(Copy, Clone)]
-struct RawPtr<'a, T: Copy>(*mut T, PhantomData<&'a T>);
+trait AsIdx: Copy {
+    fn as_idx(&self) -> usize;
+}
 
-impl<'a, T: Copy> RawPtr<'a, T> {
+impl AsIdx for Var {
     #[inline]
-    fn copy(&mut self, src: &Self, n: usize) {
-        unsafe { ptr::copy(src.0, self.0, n) }
+    fn as_idx(&self) -> usize {
+        self.0 as usize
     }
 }
 
-impl<'a, T: Copy> std::ops::Index<i32> for RawPtr<'a, T> {
-    type Output = T;
+impl AsIdx for Lit {
     #[inline]
-    fn index(&self, i: i32) -> &Self::Output {
-        unsafe { &*self.0.offset(i as isize) }
+    fn as_idx(&self) -> usize {
+        self.0 as usize
     }
 }
 
-impl<'a, T: Copy> std::ops::Add<i32> for RawPtr<'a, T> {
-    type Output = RawPtr<'a, T>;
+struct IVec<A: AsIdx, B>(Vec<B>, PhantomData<A>);
+
+impl<A: AsIdx, B: Clone> IVec<A, B> {
+    pub fn new() -> Self {
+        Self(vec![], PhantomData)
+    }
+
+    pub fn with_capacity(i: usize) -> Self {
+        Self(Vec::with_capacity(i), PhantomData)
+    }
+
+    pub fn resize(&mut self, n: usize, elt: B) {
+        self.0.resize(n, elt)
+    }
+}
+
+impl<A: AsIdx, B> std::ops::Index<A> for IVec<A, B> {
+    type Output = B;
+    fn index(&self, i: A) -> &B {
+        &self.0[i.as_idx()]
+    }
+}
+
+impl<A: AsIdx, B> std::ops::IndexMut<A> for IVec<A, B> {
+    fn index_mut(&mut self, i: A) -> &mut B {
+        &mut self.0[i.as_idx()]
+    }
+}
+
+impl Lit {
+    const SENTINEL: Self = Lit(u32::MAX);
     #[inline]
-    fn add(self, i: i32) -> Self::Output {
-        self.0 = self.0.offset(i as isize);
-        self
+    pub fn new(v: Var, sign: bool) -> Self {
+        Lit(v.0 << 1 | (sign as u32))
     }
-}
-
-impl<'a, T: Copy> std::ops::IndexMut<i32> for RawPtr<'a, T> {
     #[inline]
-    fn index_mut(&mut self, i: i32) -> &mut Self::Output {
-        unsafe { &mut *self.0.offset(i as isize) }
+    pub fn from_i32(i: i32) -> Self {
+        Lit(norm_lit(i) as u32)
+    }
+    #[inline]
+    pub fn sign(self) -> bool {
+        (self.0 & 1) != 0
+    }
+    #[inline]
+    pub fn var(self) -> Var {
+        Var(self.0 >> 1)
     }
 }
 
-struct DB<'a> {
-    data: *mut i32,
-    mem_max: usize,
-    mem_used: usize,
-    phantom: PhantomData<&'a ()>,
+impl Var {
+    const SENTINEL: Self = Var(u32::MAX);
 }
 
-impl<'a> DB<'a> {
-    fn new(mem_max: usize) -> Self {
-        let data = unsafe {
-            alloc::realloc(
-                ptr::null_mut(),
-                alloc::Layout::new::<i32>(),
-                mem_max,
-            ) as *mut i32
-        };
-        Self { mem_max, mem_used: 0, data, phantom: PhantomData }
-    }
-
-    fn get_memory(&mut self, mem_size: usize) -> RawPtr<'a, i32> {
-        if self.mem_used + mem_size > self.mem_max {
-            panic!("c out of memory");
-        }
-        let store = self.data.offset(self.mem_used as isize);
-        self.mem_used += mem_size;
-        RawPtr(store, PhantomData)
+impl Into<i32> for Lit {
+    fn into(self) -> i32 {
+        self.var().0 as i32 * if self.sign() { 1 } else { -1 }
     }
 }
 
-pub struct Solver<'a> {
-    db: DB<'a>, // memory arena
+type ClauseIdx = usize;
+const CLAUSE_END: ClauseIdx = usize::MAX;
+
+pub struct Solver {
     n_vars: usize,
     n_clauses: usize,
     max_lemmas: usize,
-    buffer: RawPtr<'a, i32>,
+    clauses: Vec<Lit>, // storage for clauses
+    buffer: Vec<Lit>,  // A buffer to store a temporary clause
     n_lemmas: usize,
     n_conflicts: usize,
-    model: RawPtr<'a, i32>,
-    reason: RawPtr<'a, i32>,
-    false_: RawPtr<'a, i32>,      // lit assignment
-    false_stack: RawPtr<'a, i32>, // Stack of falsified literals — constant ptr
-    assigned: RawPtr<'a, i32>,    // offset in false_stack
-    forced: RawPtr<'a, i32>,      // offset in false_stack
-    processed: RawPtr<'a, i32>,   // offset in false_stack
-    first: RawPtr<'a, i32>,
-    next: RawPtr<'a, i32>,
-    prev: RawPtr<'a, i32>,
+    model: IVec<Var, bool>, // Full assignment of the variables (initially set to false)
+    reason: IVec<Var, usize>, // Array of clauses
+    false_: IVec<Lit, i32>, // lit assignment (non-zero means false)
+    false_stack: Vec<Lit>,  // Stack of falsified literals (trail)
+    forced: usize,          // offset in false_stack at first decision
+    processed: usize,       // offset in false_stack at first unprocessed lit
+    assigned: usize,        // offset in false_stack at last unprocessed lit
+    first: IVec<Lit, ClauseIdx>, // watch pointer
+    next: IVec<Var, Var>,   // Next variable in the heuristic order
+    prev: IVec<Var, Var>,   // Previous variable in the heuristic order
     head: usize,
     n_restarts: usize,
     fast: usize,
     slow: usize,
 }
 
-impl<'a> Solver<'a> {
-    fn new(n_vars: usize, n_clauses: usize) -> Self {
-        let db = DB::new(1 << 30);
-        let false_stack = db.get_memory(n_vars + 1);
-        let mut solver = Solver {
-            db,
-            n_vars,
-            n_clauses,
+impl Solver {
+    fn new() -> Self {
+        Solver {
+            n_vars: 0,
+            n_clauses: 0,
             max_lemmas: 2000,
+            clauses: Vec::with_capacity(2000),
             n_lemmas: 0,
             n_conflicts: 0,
             n_restarts: 0,
             fast: 1 << 24,
             slow: 1 << 24,
-            false_: db.get_memory(n_vars + 1) + n_vars as i32,
-            false_stack,
-            assigned: false_stack,
-            forced: false_stack,
-            processed: false_stack,
-            model: db.get_memory(n_vars + 1),
-            reason: db.get_memory(n_vars + 1),
-            next: db.get_memory(n_vars + 1),
-            prev: db.get_memory(n_vars + 1),
-            first: db.get_memory(n_vars + 1) + n_vars as i32,
-            buffer: db.get_memory(n_vars),
-            head: n_vars,
-        };
-        db.data.offset(db.mem_used as isize).write(0);
-        db.mem_used += 1; // Make sure there is a 0 before the clauses are loaded.
-        solver
+            false_: IVec::new(),
+            false_stack: vec![],
+            assigned: 0,
+            forced: 0,
+            processed: 0,
+            model: IVec::new(),
+            reason: IVec::new(),
+            next: IVec::new(),
+            prev: IVec::new(),
+            first: IVec::new(),
+            buffer: vec![],
+            head: 0,
+        }
+    }
+
+    fn ensure(&mut self, n_vars: usize, n_clauses: usize) {
+        let old_n = self.n_vars;
+        self.n_vars = usize::max(self.n_vars, n_vars);
+        self.n_clauses = usize::max(self.n_clauses, n_clauses);
+        self.false_.resize(n_vars * 2, 0);
+        self.false_stack.resize(n_vars, Lit::SENTINEL);
+        self.first.resize(n_vars * 2, CLAUSE_END);
+        self.model.resize(n_vars, false);
+        self.next.resize(n_vars, Var::SENTINEL);
+        self.prev.resize(n_vars, Var::SENTINEL);
+
+        // initialize main data structure for the new variables
+        for i in old_n + 1..=self.n_vars {
+            let v = Var(i as u32);
+            self.prev[v] = Var(i as u32 - 1);
+            self.next[Var(i as u32 - 1)] = v; // TODO: what if list already modified?
+            self.false_[Lit::new(v, true)] = 0;
+            self.false_[Lit::new(v, false)] = 0;
+            // initialize watch list
+            self.first[Lit::new(v, true)] = CLAUSE_END;
+            self.first[Lit::new(v, false)] = CLAUSE_END;
+        }
+        // FIXME: what if we've searched already?
+        self.head = self.n_vars; // head of double linked list
     }
 
     #[inline]
-    fn unassign(&mut self, lit: i32) {
+    fn unassign(&mut self, lit: Lit) {
         self.false_[lit] = 0
     }
 
@@ -146,7 +190,8 @@ impl<'a> Solver<'a> {
     }
 
     /// Add `self.buffer` to the list of clauses.
-    fn add_clause(&mut self, c: RawPtr<'a, i32>, n: usize, lemma: bool) {
+    fn add_clause(&mut self, n: usize, lemma: bool) {
+        self.clauses.reserve(n + 2);
         // TODO: push clause
         if lemma {
             self.n_lemmas += 1
@@ -163,7 +208,7 @@ impl<'a> Solver<'a> {
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
-fn parse(filename: &str) -> Res<Solver> {
+fn parse(solver: &mut Solver, filename: &str) -> Res<()> {
     use io::BufRead;
     let mut lines = io::BufReader::new(std::fs::File::open(filename)?)
         .lines()
@@ -185,25 +230,26 @@ fn parse(filename: &str) -> Res<Solver> {
             return Err("expected `p cnf <n> <m>`".into());
         }
     };
-    let solver = Solver::new(n, m);
+    solver.ensure(n, m);
     for line in lines {
         let mut size = 0;
         let line = line?;
         for c in line.trim().split_whitespace() {
             let i = str::parse::<i32>(c).expect("expected integer");
             if i == 0 {
-                solver.add_clause(solver.buffer, size, false);
+                solver.add_clause(size, false);
             } else {
-                solver.buffer[size as i32] = i;
+                solver.buffer[size] = Lit::from_i32(i);
                 size += 1;
             }
         }
     }
-    Ok(solver)
+    Ok(())
 }
 
 fn main() -> Res<()> {
-    let mut s = parse("foo.cnf")?;
+    let mut s = Solver::new();
+    parse(&mut s, "foo.cnf")?;
     let r = s.solve();
     match r {
         R::Sat => println!("s SATISFIABLE"),
