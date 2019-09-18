@@ -8,7 +8,7 @@ const IMPLIED: i32 = 6;
 struct Solver {
     db: *mut i32,
     n_vars: i32,
-    n_clauses: i32,
+    pub n_clauses: i32,
     mem_used: usize, // The number of integers allocated in the DB
     mem_fixed: usize,
     mem_max: usize,
@@ -56,9 +56,12 @@ impl Solver {
         *self.false_.offset(-lit as isize) = if forced { IMPLIED } else { 1 };
         // push it on the assignment stack
         *self.assigned = -lit;
-        self.assigned = self.assigned.offset(1);
+        self.assigned = self.assigned.add(1);
         // Set the reason clause of lit
-        *self.reason.offset(lit.abs() as isize) = 1 + (reason as usize - self.db as usize) as i32;
+        // NOTE: we don't have `ptr::offset_from` on stable rust…
+        let reas = 1 + ((reason as usize - self.db as usize) / std::mem::size_of::<i32>()) as i32;
+        *self.reason.offset(lit.abs() as isize) = reas;
+        //println!("assign lit {} (reason {:?})", lit, reas);
         // Mark the literal as true in the model
         *self.model.offset(lit.abs() as isize) = (lit > 0) as i32;
     }
@@ -70,7 +73,7 @@ impl Solver {
         *self.first.offset(lit as isize) = mem;
     }
 
-    /// Allocate memory of size mem_size
+    /// Allocate memory of size `mem_size`
     unsafe fn get_memory(&mut self, mem_size: usize) -> *mut i32 {
         if self.mem_used + mem_size > self.mem_max {
             // in case the code is used within a code base
@@ -84,6 +87,7 @@ impl Solver {
 
     /// Adds a clause stored in `*lits` of size `size`
     unsafe fn add_clause(&mut self, lits: *const i32, size: usize, irr: bool) -> *mut i32 {
+        //println!( "add_clause[irr:{}] {:?}", irr, std::slice::from_raw_parts(lits, size));
         // Store a pointer to the beginning of the clause
         let i = self.mem_used;
         let used = i as i32;
@@ -174,7 +178,10 @@ impl Solver {
         }
     }
 
-    // Move the variable to the front of the decision list
+    /// Bump the variable as taking part in a conflict.
+    ///
+    /// - move the variable to the front of the decision list
+    /// - `MARK` it if it's not a top-level unit
     unsafe fn bump(&mut self, lit: i32) {
         if *self.false_.offset(lit as isize) != IMPLIED {
             // MARK the literal as involved if not a top-level unit
@@ -182,9 +189,9 @@ impl Solver {
             let var = lit.abs() as isize;
             if var != self.head as isize {
                 // In case var is not already the head of the list,
-                // Update the prev link
+                // update the prev link
                 *self.prev.offset(*self.next.offset(var) as isize) = *self.prev.offset(var);
-                // Update the next link
+                // update the next link
                 *self.next.offset(*self.prev.offset(var) as isize) = *self.next.offset(var);
                 // Add a next link to the head
                 *self.next.offset(self.head as isize) = var as i32;
@@ -232,40 +239,105 @@ impl Solver {
     }
 
     /// Compute a resolvent from falsified clause
-    unsafe fn analyze(&mut self, _clause: *mut i32) -> *mut i32 {
-        unimplemented!("analyze"); // TODO
+    unsafe fn analyze(&mut self, mut clause: *mut i32) -> *mut i32 {
+        // Bump restarts and update the statistic
+        self.res += 1;
+        self.n_conflicts += 1;
+
+        // MARK all literals in the falsified clause
+        while *clause != 0 {
+            self.bump(*clause);
+            clause = clause.add(1);
+        }
+
+        // Loop on variables on `false_stack` until the last decision,
+        // as all resolution steps are done at current (conflict) level.
+        'ext: loop {
+            self.assigned = self.assigned.sub(1);
+            if *self.reason.offset((*self.assigned).abs() as isize) == 0 {
+                break; // decision, stop here
+            }
+
+            // If the tail of the stack is MARK
+            if *self.false_.offset(*self.assigned as isize) == MARK {
+                // Pointer to check if first-UIP is reached
+                let mut check = self.assigned;
+
+                // Check for a MARK literal before decision
+                loop {
+                    check = check.sub(1);
+                    if *self.false_.offset(*check as isize) == MARK {
+                        break;
+                    }
+
+                    if *self.reason.offset((*check).abs() as isize) != 0 {
+                        // Otherwise it is the first-UIP so break
+                        break 'ext;
+                    }
+                }
+
+                // Get the reason and ignore first literal
+                clause = self
+                    .db
+                    .offset(*self.reason.offset((*self.assigned).abs() as isize) as isize);
+                // MARK all literals in reason
+                while *clause != 0 {
+                    self.bump(*clause);
+                    clause = clause.add(1);
+                }
+
+                // Unassign the tail of the stack
+                self.unassign(*self.assigned);
+            }
+        }
+
+        // Build conflict clause; Empty the clause buffer
+        let mut size = 0;
+        let mut lbd = 0;
+        let mut flag = 0;
+
+        // Loop from tail to front; only literals on the stack can be MARKed
+        self.processed = self.assigned;
+        let mut p = self.assigned;
+        while p >= self.forced {
+            if *self.false_.offset(*p as isize) == MARK && !self.implied(*p) {
+                // If MARKed and not implied, add literal to conflict clause buffer
+                *self.buffer.add(size) = *p;
+                size += 1;
+                flag = 1;
+            }
+            if *self.reason.offset((*p).abs() as isize) == 0 {
+                // Increase LBD for a decision with a true flag
+                lbd += flag;
+                flag = 0;
+                if size == 1 {
+                    // update the processed pointer
+                    self.processed = p;
+                }
+            }
+            // Reset the MARK flag for all variables on the stack
+            *self.false_.offset(*p as isize) = 1;
+            p = p.sub(1);
+        }
+
+        // Update the fast moving average
+        self.fast -= self.fast >> 5;
+        self.fast += lbd << 15;
+        // Update the slow moving average
+        self.slow -= self.slow >> 15;
+        self.slow += lbd << 5;
+
+        // Loop over all unprocessed literals to unassign them.
+        while self.assigned > self.processed {
+            self.unassign(*self.assigned);
+            self.assigned = self.assigned.sub(1);
+        }
+        // TODO: DRAT output here
+        // Terminate the buffer (and potentially print clause)
+        *self.buffer.add(size) = 0;
+        // Add new conflict clause to redundant DB
+        self.add_clause(self.buffer, size, false)
     }
-    /* TODO
-        int* analyze (struct solver* S, int* clause) {         // Compute a resolvent from falsified clause
-          S->res++; S->nConflicts++;                           // Bump restarts and update the statistic
-          while (*clause) bump (S, *(clause++));               // MARK all literals in the falsified clause
-          while (S->reason[abs (*(--S->assigned))]) {          // Loop on variables on falseStack until the last decision
-            if (S->false[*S->assigned] == MARK) {              // If the tail of the stack is MARK
-              int *check = S->assigned;                        // Pointer to check if first-UIP is reached
-              while (S->false[*(--check)] != MARK)             // Check for a MARK literal before decision
-                if (!S->reason[abs(*check)]) goto build;       // Otherwise it is the first-UIP so break
-              clause = S->DB + S->reason[abs (*S->assigned)];  // Get the reason and ignore first literal
-              while (*clause) bump (S, *(clause++)); }         // MARK all literals in reason
-            unassign (S, *S->assigned); }                      // Unassign the tail of the stack
-
-          build:; int size = 0, lbd = 0, flag = 0;             // Build conflict clause; Empty the clause buffer
-          int* p = S->processed = S->assigned;                 // Loop from tail to front
-          while (p >= S->forced) {                             // Only literals on the stack can be MARKed
-            if ((S->false[*p] == MARK) && !implied (S, *p)) {  // If MARKed and not implied
-              S->buffer[size++] = *p; flag = 1; }              // Add literal to conflict clause buffer
-            if (!S->reason[abs (*p)]) { lbd += flag; flag = 0; // Increase LBD for a decision with a true flag
-              if (size == 1) S->processed = p; }               // And update the processed pointer
-            S->false[*(p--)] = 1; }                            // Reset the MARK flag for all variables on the stack
-
-          S->fast -= S->fast >>  5; S->fast += lbd << 15;      // Update the fast moving average
-          S->slow -= S->slow >> 15; S->slow += lbd <<  5;      // Update the slow moving average
-
-          while (S->assigned > S->processed)                   // Loop over all unprocessed literals
-            unassign (S, *(S->assigned--));                    // Unassign all lits between tail & head
-          unassign (S, *S->assigned);                          // Assigned now equal to processed
-          S->buffer[size] = 0;                                 // Terminate the buffer (and potentially print clause)
-          return addClause (S, S->buffer, size, 0); }          // Add new conflict clause to redundant DB
-    */
 
     /// Performs unit propagation
     unsafe fn propagate(&mut self) -> bool {
@@ -282,7 +354,7 @@ impl Solver {
             let mut watch = self.first.offset(lit as isize);
 
             // Loop while there are clauses watched by lit
-            while (*watch != END) {
+            while *watch != END {
                 // Let's assume that the clause is unit
                 let mut unit = true;
                 // Get the clause from DB
@@ -301,13 +373,12 @@ impl Solver {
                 // Scan the non-watched literals
                 let mut i = 2;
                 while unit && *clause.offset(i) != 0 {
-                    let lit_i = *clause.offset(i);
-                    if *self.false_.offset(lit_i as isize) == 0 {
+                    if *self.false_.offset(*clause.offset(i) as isize) == 0 {
                         // When `clause[i]` is not false, it is either true or
                         // unset, so we just have to use `clause[i]` as new watch.
 
                         // Swap literals
-                        *clause.offset(1) = lit_i;
+                        *clause.offset(1) = *clause.offset(i);
                         *clause.offset(i) = lit;
 
                         // Store the old watch
@@ -317,7 +388,7 @@ impl Solver {
                         // Remove the watch from the watchlist of `lit`
                         *watch = *self.db.offset(*watch as isize);
                         // Add the watch to the list of `clause[1]`
-                        self.add_watch(lit_i, store);
+                        self.add_watch(*clause.offset(1), store);
                     }
 
                     i += 1;
@@ -389,11 +460,11 @@ impl Solver {
                     self.res = 0;
                     self.fast = (self.slow / 100) * 125;
                     self.restart();
-                }
 
-                if self.n_lemmas > self.max_lemmas {
-                    // Reduce the DB when it contains too many lemmas
-                    self.reduce_db(6);
+                    if self.n_lemmas > self.max_lemmas {
+                        // Reduce the DB when it contains too many lemmas
+                        self.reduce_db(6);
+                    }
                 }
             }
 
@@ -503,6 +574,7 @@ impl Solver {
         s
     }
 
+    /// Create a new solver for the given number of variables and clauses.
     pub fn new(n_vars: i32, n_clauses: i32) -> Self {
         unsafe { Self::new_(n_vars, n_clauses) }
     }

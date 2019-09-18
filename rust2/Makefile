@@ -3,6 +3,9 @@
 all:
 	cargo build --release
 
+debug:
+	cargo build
+
 run:
 	cargo run --release
 
