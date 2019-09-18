@@ -83,7 +83,7 @@ impl Solver {
     }
 
     /// Adds a clause stored in `*lits` of size `size`
-    unsafe fn add_clause(&mut self, lits: *mut i32, size: usize, irr: bool) -> *mut i32 {
+    unsafe fn add_clause(&mut self, lits: *const i32, size: usize, irr: bool) -> *mut i32 {
         // Store a pointer to the beginning of the clause
         let i = self.mem_used;
         let used = i as i32;
@@ -108,6 +108,14 @@ impl Solver {
         }
         // Return the pointer to the clause in the database
         clause
+    }
+
+    /// Add a clause stored as a slice.
+    fn add_clause_slice(&mut self, lits: &[i32], irr: bool) {
+        unsafe {
+            let ptr = lits.as_ptr();
+            self.add_clause(ptr, lits.len(), irr);
+        }
     }
 
     unsafe fn reduce_db(&mut self, k: usize) {
@@ -252,6 +260,12 @@ impl Solver {
           unassign (S, *S->assigned);                          // Assigned now equal to processed
           S->buffer[size] = 0;                                 // Terminate the buffer (and potentially print clause)
           return addClause (S, S->buffer, size, 0); }          // Add new conflict clause to redundant DB
+    */
+
+    fn solve(&mut self) -> bool {
+        unimplemented!("solve")
+    }
+    /*
 
     int solve (struct solver* S) {                                      // Determine satisfiability
       int decision = S->head; S->res = 0;                               // Initialize the solver
@@ -273,7 +287,13 @@ impl Solver {
         S->false[-decision] = 1;                                        // Assign the decision literal to true (change to IMPLIED-1?)
         *(S->assigned++) = -decision;                                   // And push it on the assigned stack
         decision = abs(decision); S->reason[decision] = 0; } }          // Decisions have no reason clauses
+    */
 
+    fn new(n_vars: i32, n_clauses: i32) -> Self {
+        unimplemented!(); // TODO
+    }
+
+    /*
     void initCDCL (struct solver* S, int n, int m) {
       if (n < 1)      n = 1;                  // The code assumes that there is at least one variable
       S->nVars          = n;                  // Set the number of variables
@@ -305,14 +325,10 @@ impl Solver {
         S->first[i] = S->first[-i] = END; }                    // and first (watch pointers).
       S->head = n; }                                           // Initialize the head of the double-linked list
             */
-
-    fn new(n_vars: i32, n_clauses: usize) -> Self {
-        unimplemented!(); // TODO
-    }
 }
 
-/// Parse the formula and initialize
-fn parse(filename: &str) -> Solver {
+/// Parse the formula and initialize the solver. Returns SAT or UNSAT as well.
+fn parse(filename: &str) -> (Solver, bool) {
     use std::{fs::File, io, io::BufRead};
     // Read the CNF file
     let file = File::open(filename).expect("cannot open file");
@@ -329,8 +345,8 @@ fn parse(filename: &str) -> Solver {
             if chunks.len() != 4 || chunks[0] != "p" || chunks[1] != "cnf" {
                 panic!("expected `p cnf <n> <n>` line, got {:?}", s);
             }
-            let n_vars: usize = chunks[2].parse().expect("expected int for number of vars");
-            let n_clauses: usize = chunks[3]
+            let n_vars: i32 = chunks[2].parse().expect("expected int for number of vars");
+            let n_clauses: i32 = chunks[3]
                 .parse()
                 .expect("expected int for number of clauses");
             (n_vars, n_clauses)
@@ -340,10 +356,9 @@ fn parse(filename: &str) -> Solver {
     } else {
         panic!("did not find the `p cnf` line");
     };
-    // TODO let solver = Solver::new(n_vars, n_clauses);
+    let mut solver = Solver::new(n_vars, n_clauses);
     println!("c problem has {} vars, {} clauses", n_vars, n_clauses);
-    let mut size = 0;
-    let mut lits = Vec::new();
+    let mut lits = Vec::with_capacity(n_vars as usize);
     // parse clauses from the rest of the lines
     for line in iter {
         lits.clear();
@@ -355,8 +370,11 @@ fn parse(filename: &str) -> Solver {
             }
         }
         println!("parsed clause {:?}", &lits);
-        // TODO: add to solver
+        solver.add_clause_slice(&lits, true); // Add the clause to the database
+
+        // TODO: check for empty clause or conflicting unit, and return UNSAT if that's the case
     }
+    drop(lits);
 
     /* TODO
     initCDCL (S, S->nVars, S->nClauses);                     // Allocate the main datastructures
@@ -374,7 +392,7 @@ fn parse(filename: &str) -> Solver {
     fclose (input);                                          // Close the formula file
     return SAT; }                                            // Return that no conflict was observed
       */
-    unimplemented!() // TODO
+    (solver, true)
 }
 
 // The main procedure for a STANDALONE solver
@@ -383,7 +401,20 @@ fn main() {
         .skip(1)
         .next()
         .expect("usage: microsat <file>");
-    let s = parse(&filename);
+    let (mut s, status) = parse(&filename);
+    if !status {
+        println!("s UNSATISFIABLE");
+    } else if !s.solve() {
+        println!("s UNSATISFIABLE");
+    } else {
+        println!("s SATISFIABLE");
+    }
+
+    println!(
+        "c statistics of {}: mem: {} conflicts: {} max_lemmas: {}",
+        filename, s.mem_used, s.n_conflicts, s.max_lemmas
+    );
+
     /* TODO
     if      (parse (&S, argv[1]) == UNSAT) printf("s UNSATISFIABLE\n");  // Parse the DIMACS file in argv[1]
     else if (solve (&S)          == UNSAT) printf("s UNSATISFIABLE\n");  // Solve without limit (number of conflicts)
