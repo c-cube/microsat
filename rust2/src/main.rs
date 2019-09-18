@@ -1,6 +1,6 @@
+use std::ptr;
+
 const END: i32 = -9;
-const UNSAT: i32 = 0;
-const SAT: i32 = 1;
 const MARK: i32 = 2;
 const IMPLIED: i32 = 6;
 
@@ -9,27 +9,27 @@ struct Solver {
     db: *mut i32,
     n_vars: i32,
     n_clauses: i32,
-    mem_used: usize,
+    mem_used: usize, // The number of integers allocated in the DB
     mem_fixed: usize,
     mem_max: usize,
-    max_lemmas: usize,
-    n_lemmas: usize,
-    buffer: *mut i32,
-    n_conflicts: usize,
-    model: *mut i32,
-    reason: *mut i32,
-    false_stack: *mut i32,
-    false_: *mut i32,
-    first: *mut i32,
-    forced: *mut i32,
-    processed: *mut i32,
-    assigned: *mut i32,
-    next: *mut i32,
-    prev: *mut i32,
+    max_lemmas: usize,     // maximum number of learnt clauses
+    n_lemmas: usize,       // The number of learned clauses -- redundant means learned
+    buffer: *mut i32,      // A buffer to store a temporary clause
+    n_conflicts: usize,    // Under of conflicts which is used to updates scores
+    model: *mut i32,       // Full assignment of the (Boolean) variables (initially set to false)
+    reason: *mut i32,      // Array of clauses
+    false_stack: *mut i32, // Stack of falsified literals -- this pointer is never changed
+    false_: *mut i32,      // Labels for variables, non-zero means false
+    first: *mut i32,       // Offset of the first watched clause
+    forced: *mut i32,      // Points inside *falseStack at first decision (unforced literal)
+    processed: *mut i32,   // Points inside *falseStack at first unprocessed literal
+    assigned: *mut i32,    // Points inside *falseStack at last unprocessed literal
+    next: *mut i32,        // Next variable in the heuristic order
+    prev: *mut i32,        // Previous variable in the heuristic order
     head: i32,
-    res: i32,
-    fast: i32,
-    slow: i32,
+    res: i32,  // Number of resolutions
+    fast: i32, // moving average
+    slow: i32, // moving average
 }
 
 impl Solver {
@@ -111,13 +111,14 @@ impl Solver {
     }
 
     /// Add a clause stored as a slice.
-    fn add_clause_slice(&mut self, lits: &[i32], irr: bool) {
+    pub fn add_clause_slice(&mut self, lits: &[i32], irr: bool) -> *mut i32 {
         unsafe {
             let ptr = lits.as_ptr();
-            self.add_clause(ptr, lits.len(), irr);
+            self.add_clause(ptr, lits.len(), irr)
         }
     }
 
+    /// Garbage collect lemmas.
     unsafe fn reduce_db(&mut self, k: usize) {
         // Removes "less useful" lemmas from DB
         while self.n_lemmas > self.max_lemmas {
@@ -230,6 +231,10 @@ impl Solver {
         true
     }
 
+    /// Compute a resolvent from falsified clause
+    unsafe fn analyze(&mut self, _clause: *mut i32) -> *mut i32 {
+        unimplemented!("analyze"); // TODO
+    }
     /* TODO
         int* analyze (struct solver* S, int* clause) {         // Compute a resolvent from falsified clause
           S->res++; S->nConflicts++;                           // Bump restarts and update the statistic
@@ -262,69 +267,254 @@ impl Solver {
           return addClause (S, S->buffer, size, 0); }          // Add new conflict clause to redundant DB
     */
 
-    fn solve(&mut self) -> bool {
-        unimplemented!("solve")
+    /// Performs unit propagation
+    unsafe fn propagate(&mut self) -> bool {
+        // TODO: use a boolean…
+        // Initialize forced flag
+        let mut forced = *self.reason.offset(*self.processed as isize);
+
+        // Loop while there are unprocessed false literals
+        while self.processed < self.assigned {
+            // Get first unprocessed literal
+            let lit = *self.processed;
+            self.processed = self.processed.add(1);
+            // Obtain the first watch pointer
+            let mut watch = self.first.offset(lit as isize);
+
+            // Loop while there are clauses watched by lit
+            while (*watch != END) {
+                // Let's assume that the clause is unit
+                let mut unit = true;
+                // Get the clause from DB
+                let mut clause = self.db.offset(*watch as isize + 1);
+
+                // TODO: explain this part ‽
+                // Set the pointer to the first literal in the clause
+                if *clause.offset(-2) == 0 {
+                    clause = clause.offset(1);
+                }
+                // Ensure that the other watched literal is in front
+                if *clause == lit {
+                    *clause = *clause.offset(1);
+                }
+
+                // Scan the non-watched literals
+                let mut i = 2;
+                while unit && *clause.offset(i) != 0 {
+                    let lit_i = *clause.offset(i);
+                    if *self.false_.offset(lit_i as isize) == 0 {
+                        // When `clause[i]` is not false, it is either true or
+                        // unset, so we just have to use `clause[i]` as new watch.
+
+                        // Swap literals
+                        *clause.offset(1) = lit_i;
+                        *clause.offset(i) = lit;
+
+                        // Store the old watch
+                        let store = *watch;
+                        // Stop the loop after this iteration
+                        unit = false;
+                        // Remove the watch from the watchlist of `lit`
+                        *watch = *self.db.offset(*watch as isize);
+                        // Add the watch to the list of `clause[1]`
+                        self.add_watch(lit_i, store);
+                    }
+
+                    i += 1;
+                }
+
+                if unit {
+                    // If the clause is indeed unit, place lit at clause[1] and update next watch
+                    *clause.offset(1) = lit;
+                    watch = self.db.offset(*watch as isize);
+
+                    if *self.false_.offset(-*clause as isize) != 0 {
+                        // If the other watched literal is satisfied, continue
+                        continue;
+                    } else if *self.false_.offset(*clause as isize) == 0 {
+                        // If the other watched literal is falsified, a unit clause is found, and
+                        // the reason is set
+                        self.assign(clause, forced != 0);
+                    } else if forced != 0 {
+                        return false; // Found a root level conflict -> UNSAT
+                    } else {
+                        // Analyze the conflict, to return a conflict clause
+                        let lemma = self.analyze(clause);
+                        if *lemma.offset(1) == 0 {
+                            // In case a unit clause is found, set `forced` flag
+                            forced = 1;
+                        }
+                        // Assign the conflict clause as a unit
+                        self.assign(lemma, forced != 0);
+                        break;
+                    }
+                }
+            }
+        }
+        if forced != 0 {
+            // Set S->forced if applicable
+            self.forced = self.processed;
+        }
+        true
     }
-    /*
 
-    int solve (struct solver* S) {                                      // Determine satisfiability
-      int decision = S->head; S->res = 0;                               // Initialize the solver
-      for (;;) {                                                        // Main solve loop
-        int old_nLemmas = S->nLemmas;                                   // Store nLemmas to see whether propagate adds lemmas
-        if (propagate (S) == UNSAT) return UNSAT;                       // Propagation returns UNSAT for a root level conflict
+    unsafe fn solve_(&mut self) -> bool {
+        let mut decision = self.head;
+        self.res = 0;
 
-        if (S->nLemmas > old_nLemmas) {                                 // If the last decision caused a conflict
-          decision = S->head;                                           // Reset the decision heuristic to head
-          if (S->fast > (S->slow / 100) * 125) {                        // If fast average is substantially larger than slow average
-    //        printf("c restarting after %i conflicts (%i %i) %i\n", S->res, S->fast, S->slow, S->nLemmas > S->maxLemmas);
-            S->res = 0; S->fast = (S->slow / 100) * 125; restart (S);   // Restart and update the averages
-            if (S->nLemmas > S->maxLemmas) reduceDB (S, 6); } }         // Reduce the DB when it contains too many lemmas
+        // main solve loop
+        loop {
+            // Store n_lemmas to see whether propagate adds lemmas
+            let old_n_lemmas = self.n_lemmas;
+            if !self.propagate() {
+                // Propagation returns UNSAT for a root level conflict
+                return false;
+            }
 
-        while (S->false[decision] || S->false[-decision]) {             // As long as the temporay decision is assigned
-          decision = S->prev[decision]; }                               // Replace it with the next variable in the decision list
-        if (decision == 0) return SAT;                                  // If the end of the list is reached, then a solution is found
-        decision = S->model[decision] ? decision : -decision;           // Otherwise, assign the decision variable based on the model
-        S->false[-decision] = 1;                                        // Assign the decision literal to true (change to IMPLIED-1?)
-        *(S->assigned++) = -decision;                                   // And push it on the assigned stack
-        decision = abs(decision); S->reason[decision] = 0; } }          // Decisions have no reason clauses
-    */
+            if self.n_lemmas > old_n_lemmas {
+                // If the last decision caused a conflict
+                decision = self.head;
 
-    fn new(n_vars: i32, n_clauses: i32) -> Self {
-        unimplemented!(); // TODO
+                if self.fast > (self.slow / 100) * 125 {
+                    // If fast average is substantially larger than slow average
+                    println!(
+                        "c restarting after {} conflicts ({} {}) {}",
+                        self.res,
+                        self.fast,
+                        self.slow,
+                        self.n_lemmas > self.max_lemmas
+                    );
+
+                    // Restart and update the averages
+                    self.res = 0;
+                    self.fast = (self.slow / 100) * 125;
+                    self.restart();
+                }
+
+                if self.n_lemmas > self.max_lemmas {
+                    // Reduce the DB when it contains too many lemmas
+                    self.reduce_db(6);
+                }
+            }
+
+            // As long as the temporay decision is assigned,
+            // replace it with the next variable in the decision list
+            while *self.false_.offset(decision as isize) != 0
+                || *self.false_.offset(-decision as isize) != 0
+            {
+                decision = *self.prev.offset(decision as isize);
+            }
+
+            if decision == 0 {
+                // If the end of the list is reached, then a solution is found
+                return true;
+            } else {
+                // Otherwise, assign the decision variable based on the model (phase saving)
+                decision = if *self.model.offset(decision as isize) != 0 {
+                    decision
+                } else {
+                    -decision
+                };
+                // Assign the decision literal to true, and push it on the assigned stack
+                *self.false_.offset(-decision as isize) = 1;
+                *self.assigned = -decision;
+                self.assigned = self.assigned.add(1);
+                // Set the reason to 0
+                decision = decision.abs();
+                *self.reason.offset(decision as isize) = 0;
+            }
+        }
     }
 
-    /*
-    void initCDCL (struct solver* S, int n, int m) {
-      if (n < 1)      n = 1;                  // The code assumes that there is at least one variable
-      S->nVars          = n;                  // Set the number of variables
-      S->nClauses       = m;                  // Set the number of clauases
-      S->mem_max        = 1 << 30;            // Set the initial maximum memory
-      S->mem_used       = 0;                  // The number of integers allocated in the DB
-      S->nLemmas        = 0;                  // The number of learned clauses -- redundant means learned
-      S->nConflicts     = 0;                  // Under of conflicts which is used to updates scores
-      S->maxLemmas      = 2000;               // Initial maximum number of learnt clauses
-      S->fast = S->slow = 1 << 24;            // Initialize the fast and slow moving averages
+    /// Determine satisfiability.
+    ///
+    /// Returns `true` if the set of clauses is SAT, `false` if UNSAT.
+    pub fn solve(&mut self) -> bool {
+        unsafe { self.solve_() }
+    }
 
-      S->DB = (int *) malloc (sizeof (int) * S->mem_max); // Allocate the initial database
-      S->model       = getMemory (S, n+1); // Full assignment of the (Boolean) variables (initially set to false)
-      S->next        = getMemory (S, n+1); // Next variable in the heuristic order
-      S->prev        = getMemory (S, n+1); // Previous variable in the heuristic order
-      S->buffer      = getMemory (S, n  ); // A buffer to store a temporary clause
-      S->reason      = getMemory (S, n+1); // Array of clauses
-      S->falseStack  = getMemory (S, n+1); // Stack of falsified literals -- this pointer is never changed
-      S->forced      = S->falseStack;      // Points inside *falseStack at first decision (unforced literal)
-      S->processed   = S->falseStack;      // Points inside *falseStack at first unprocessed literal
-      S->assigned    = S->falseStack;      // Points inside *falseStack at last unprocessed literal
-      S->false       = getMemory (S, 2*n+1); S->false += n; // Labels for variables, non-zero means false
-      S->first       = getMemory (S, 2*n+1); S->first += n; // Offset of the first watched clause
-      S->DB[S->mem_used++] = 0;            // Make sure there is a 0 before the clauses are loaded.
+    unsafe fn new_(n_vars: i32, n_clauses: i32) -> Self {
+        let n_vars = i32::max(1, n_vars); // The code assumes that there is at least one variable
+        let mem_max = 1 << 30;
+        let db = {
+            let mut v = Vec::with_capacity(mem_max);
+            let ptr = v.as_mut_ptr();
+            std::mem::forget(v);
+            ptr
+        };
 
-      int i; for (i = 1; i <= n; i++) {                        // Initialize the main datastructes:
-        S->prev [i] = i - 1; S->next[i-1] = i;                 // the double-linked list for variable-move-to-front,
-        S->model[i] = S->false[-i] = S->false[i] = 0;          // the model (phase-saving), the false array,
-        S->first[i] = S->first[-i] = END; }                    // and first (watch pointers).
-      S->head = n; }                                           // Initialize the head of the double-linked list
-            */
+        let mut s = Solver {
+            db,
+            n_vars,
+            n_clauses,
+            mem_max,
+            mem_used: 0,
+            mem_fixed: 0,
+            res: 0,
+            n_lemmas: 0,
+            n_conflicts: 0,
+            max_lemmas: 2000,
+            fast: 1 << 24,
+            slow: 1 << 24,
+            model: ptr::null_mut(),
+            next: ptr::null_mut(),
+            prev: ptr::null_mut(),
+            buffer: ptr::null_mut(),
+            reason: ptr::null_mut(),
+            false_stack: ptr::null_mut(),
+            forced: ptr::null_mut(),
+            processed: ptr::null_mut(),
+            assigned: ptr::null_mut(),
+            false_: ptr::null_mut(),
+            first: ptr::null_mut(),
+            head: n_vars,
+        };
+        let n = n_vars as usize;
+        s.model = s.get_memory(n + 1);
+        s.next = s.get_memory(n + 1);
+        s.prev = s.get_memory(n + 1);
+        s.buffer = s.get_memory(n);
+        s.reason = s.get_memory(n + 1);
+        s.false_stack = s.get_memory(n + 1);
+        s.forced = s.false_stack;
+        s.processed = s.false_stack;
+        s.assigned = s.false_stack;
+        s.false_ = s.get_memory(2 * n + 1).add(n);
+        s.first = s.get_memory(2 * n + 1).add(n);
+        // Make sure there is a 0 before the clauses are loaded.
+        *s.db.add(s.mem_used) = 0;
+        s.mem_used += 1;
+
+        // Initialize the main datastructures:
+        for i in 1..=n {
+            // the double-linked list for variable-move-to-front
+            *s.prev.add(i) = i as i32 - 1;
+            *s.next.add(i - 1) = i as i32;
+            // the model (phase-saving), the false array
+            *s.model.add(i) = 0;
+            *s.false_.sub(i) = 0;
+            *s.false_.add(i) = 0;
+            // first (watch pointers).
+            *s.first.add(i) = END;
+            *s.first.sub(i) = END;
+        }
+        // Initialize the head of the double-linked list
+        s.head = n_vars;
+        s
+    }
+
+    pub fn new(n_vars: i32, n_clauses: i32) -> Self {
+        unsafe { Self::new_(n_vars, n_clauses) }
+    }
+}
+
+impl Drop for Solver {
+    fn drop(&mut self) {
+        unsafe {
+            let v = Vec::from_raw_parts(self.db, self.mem_max, self.mem_max);
+            drop(v)
+        }
+    }
 }
 
 /// Parse the formula and initialize the solver. Returns SAT or UNSAT as well.
@@ -332,7 +522,7 @@ fn parse(filename: &str) -> (Solver, bool) {
     use std::{fs::File, io, io::BufRead};
     // Read the CNF file
     let file = File::open(filename).expect("cannot open file");
-    let mut reader = io::BufReader::new(file);
+    let reader = io::BufReader::new(file);
     // iterate over non-comment, non empty lines
     let mut iter = reader.lines().map(|x| x.unwrap()).filter(|line| {
         let x = line.trim();
@@ -369,29 +559,21 @@ fn parse(filename: &str) -> (Solver, bool) {
                 Err(s) => panic!("expected integer, got {:?}", s),
             }
         }
-        println!("parsed clause {:?}", &lits);
-        solver.add_clause_slice(&lits, true); // Add the clause to the database
+        //println!("parsed clause {:?}", &lits);
+        let clause = solver.add_clause_slice(&lits, true); // Add the clause to the database
 
-        // TODO: check for empty clause or conflicting unit, and return UNSAT if that's the case
+        unsafe {
+            if lits.len() == 0 || (lits.len() == 1 && *solver.false_.offset(lits[0] as isize) != 0)
+            {
+                // Check for empty clause or conflicting unit, in which case UNSAT
+                return (solver, false);
+            } else if lits.len() == 1 && *solver.false_.offset(-lits[0] as isize) == 0 {
+                // Check for a new unit and assign it directly as forced
+                solver.assign(clause, true);
+            }
+        }
     }
     drop(lits);
-
-    /* TODO
-    initCDCL (S, S->nVars, S->nClauses);                     // Allocate the main datastructures
-    int nZeros = S->nClauses, size = 0;                      // Initialize the number of clauses to read
-    while (nZeros > 0) {                                     // While there are clauses in the file
-      int lit = 0; tmp = fscanf (input, " %i ", &lit);       // Read a literal.
-      if (!lit) {                                            // If reaching the end of the clause
-        int* clause = addClause (S, S->buffer, size, 1);     // Then add the clause to data_base
-        if (!size || ((size == 1) && S->false[clause[0]]))   // Check for empty clause or conflicting unit
-          return UNSAT;                                      // If either is found return UNSAT
-        if ((size == 1) && !S->false[-clause[0]]) {          // Check for a new unit
-          assign (S, clause, 1); }                           // Directly assign new units (forced = 1)
-        size = 0; --nZeros; }                                // Reset buffer
-      else S->buffer[size++] = lit; }                        // Add literal to buffer
-    fclose (input);                                          // Close the formula file
-    return SAT; }                                            // Return that no conflict was observed
-      */
     (solver, true)
 }
 
@@ -414,11 +596,4 @@ fn main() {
         "c statistics of {}: mem: {} conflicts: {} max_lemmas: {}",
         filename, s.mem_used, s.n_conflicts, s.max_lemmas
     );
-
-    /* TODO
-    if      (parse (&S, argv[1]) == UNSAT) printf("s UNSATISFIABLE\n");  // Parse the DIMACS file in argv[1]
-    else if (solve (&S)          == UNSAT) printf("s UNSATISFIABLE\n");  // Solve without limit (number of conflicts)
-    else                                   printf("s SATISFIABLE\n")  ;  // And print whether the formula has a solution
-    printf ("c statistics of %s: mem: %i conflicts: %i max_lemmas: %i\n", argv[1], S.mem_used, S.nConflicts, S.maxLemmas); }
-      */
 }
