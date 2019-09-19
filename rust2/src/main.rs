@@ -183,7 +183,7 @@ impl Solver {
     /// Make the first literal of the reason true
     unsafe fn assign(&mut self, reason: Ptr<i32>, forced: bool) {
         // let `lit` be the first literal in the reason
-        let lit = *reason;
+        let lit: i32 = reason[0];
         // Mark lit as true and `IMPLIED` if forced
         self.false_[-lit] = if forced { IMPLIED } else { 1 };
         // push it on the assignment stack
@@ -222,7 +222,9 @@ impl Solver {
         // Store a pointer to the beginning of the clause
         let i = self.mem_used;
         let used = i as i32;
-        // Allocate memory for the clause in the database
+        // Allocate memory for the clause in the database.
+        // The clause ends with "0", has `size` literals, and is prefixed
+        // by two watchlist pointers.
         let mut clause: Ptr<i32> = self.get_memory(size + 3) + 2;
         if size > 1 {
             // If the clause is not unit, then add two watch pointers to
@@ -282,17 +284,17 @@ impl Solver {
             i += 1;
         }
 
-        // Virtually remove all lemmas
+        // Virtually remove all lemmas (the range `mem_fixed .. mem_used`) *)
         let old_used = self.mem_used;
         self.mem_used = self.mem_fixed;
-        // While the old memory contains lemmas
+        // While the old memory contains lemmas, get the lemma to which
+        // the head is pointing
         let mut i = self.mem_fixed + 2;
         while i < old_used {
-            // Get the lemma to which the head is pointing
-            let mut count = 0;
+            let mut count = 0; // number of literals satisfied by current model
             let head = i;
 
-            // Count the number of literals that are satisfied by the current model
+            // `count` literals satisfied in the current model
             while self.db[i] != 0 {
                 let lit = self.db[i];
                 i += 1;
@@ -302,10 +304,10 @@ impl Solver {
             }
 
             if count < k {
-                // If the latter is smaller than k, add it back
+                // If `count` is smaller than k, add it back
                 self.add_clause(self.db + head, i - head, false);
             }
-            i += 3; // next iteration
+            i += 3; // jump over trailing 0 and the next clause's header
         }
     }
 
@@ -347,12 +349,10 @@ impl Solver {
         let mut p: Ptr<i32> = self.db + self.reason[lit.abs()] - 1;
 
         // Iterate over literals in the reason
-        loop {
+        while {
             p += 1;
-            if *p == 0 {
-                break;
-            }
-
+            *p != 0
+        } {
             // Recursively check if non-MARK literals are implied
             if (self.false_[*p] ^ MARK) != 0 && !self.implied(*p) {
                 // Mark and return not implied (denoted by IMPLIED - 1)
@@ -380,24 +380,20 @@ impl Solver {
 
         // Loop on variables on `false_stack` until the last decision,
         // as all resolution steps are done at current (conflict) level.
-        'ext: loop {
+        'ext: while {
             self.assigned -= 1;
-            if self.reason[(*self.assigned).abs()] == 0 {
-                break; // decision, stop here
-            }
-
+            self.reason[(*self.assigned).abs()] != 0
+        } {
             // If the tail of the stack is MARK
             if self.false_[*self.assigned] == MARK {
                 // Pointer to check if first-UIP is reached
                 let mut check = self.assigned;
 
                 // Check for a MARK literal before decision
-                loop {
+                while {
                     check -= 1;
-                    if self.false_[*check] == MARK {
-                        break;
-                    }
-
+                    self.false_[*check] != MARK
+                } {
                     if self.reason[(*check).abs()] == 0 {
                         // Otherwise it is the first-UIP so break
                         break 'ext;
@@ -411,10 +407,10 @@ impl Solver {
                     self.bump(*clause);
                     clause += 1;
                 }
-
-                // Unassign the tail of the stack
-                self.unassign(*self.assigned);
             }
+
+            // Unassign the tail of the stack
+            self.unassign(*self.assigned);
         }
 
         // Build conflict clause; Empty the clause buffer
@@ -471,7 +467,7 @@ impl Solver {
     unsafe fn propagate(&mut self) -> bool {
         // TODO: use a boolean…
         // Initialize forced flag
-        let mut forced = self.reason[*self.processed];
+        let mut forced = self.reason[(*self.processed).abs()];
 
         // Loop while there are unprocessed false literals
         while self.processed < self.assigned {
