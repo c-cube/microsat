@@ -190,8 +190,7 @@ impl Solver {
         *self.assigned = -lit;
         self.assigned += 1;
         // Set the reason clause of lit
-        let reas = 1 + (reason - self.db);
-        self.reason[lit.abs()] = reas as i32;
+        self.reason[lit.abs()] = 1 + (reason - self.db) as i32;
         //println!("assign lit {} (reason {:?})", lit, reas);
         // Mark the literal as true in the model
         self.model[lit.abs()] = (lit > 0) as i32;
