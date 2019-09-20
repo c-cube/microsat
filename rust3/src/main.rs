@@ -46,10 +46,6 @@ mod cptr {
         pub fn new_const(x: *const T) -> Self {
             Ptr(x as *mut T)
         }
-        pub fn new_mut(x: *mut T) -> Self {
-            Ptr(x)
-        }
-
         pub fn null() -> Self {
             Ptr(std::ptr::null_mut())
         }
@@ -62,10 +58,8 @@ mod cptr {
         }
 
         pub unsafe fn free(&mut self, n: usize) {
-            unsafe {
-                let v = Vec::from_raw_parts(self.0, n, n);
-                drop(v)
-            }
+            let v = Vec::from_raw_parts(self.0, n, n);
+            drop(v)
         }
     }
 
@@ -149,15 +143,15 @@ struct Solver {
     buffer: Ptr<i32>,      // A buffer to store a temporary clause
     n_conflicts: usize,    // Under of conflicts which is used to updates scores
     model: Vec<bool>,      // Full assignment of the (Boolean) variables (initially set to false)
-    reason: Ptr<i32>,      // Array of clauses
+    reason: Vec<i32>,      // Array of clauses
     false_stack: Ptr<i32>, // Stack of falsified literals -- this pointer is never changed
     false_: Ptr<i32>,      // Labels for variables, non-zero means false
     first: Ptr<i32>,       // Offset of the first watched clause
     forced: Ptr<i32>,      // Points inside *falseStack at first decision (unforced literal)
     processed: Ptr<i32>,   // Points inside *falseStack at first unprocessed literal
     assigned: Ptr<i32>,    // Points inside *falseStack at last unprocessed literal
-    next: Ptr<i32>,        // Next variable in the heuristic order
-    prev: Ptr<i32>,        // Previous variable in the heuristic order
+    next: Vec<i32>,        // Next variable in the heuristic order
+    prev: Vec<i32>,        // Previous variable in the heuristic order
     head: i32,
     res: i32,  // Number of resolutions
     fast: i32, // moving average
@@ -190,7 +184,7 @@ impl Solver {
         *self.assigned = -lit;
         self.assigned += 1;
         // Set the reason clause of lit
-        self.reason[lit.abs()] = 1 + (reason - self.db) as i32;
+        self.reason[lit.abs() as usize] = 1 + (reason - self.db) as i32;
         //println!("assign lit {} (reason {:?})", lit, reas);
         // Mark the literal as true in the model
         self.model[lit.abs() as usize] = lit > 0;
@@ -321,17 +315,17 @@ impl Solver {
         if self.false_[lit] != IMPLIED {
             // MARK the literal as involved if not a top-level unit
             self.false_[lit] = MARK;
-            let var = lit.abs();
+            let var = lit.abs() as i32;
             if var != self.head {
                 // In case var is not already the head of the list,
                 // update the prev link
-                self.prev[self.next[var]] = self.prev[var];
+                self.prev[self.next[var as usize] as usize] = self.prev[var as usize];
                 // update the next link
-                self.next[self.prev[var]] = self.next[var];
+                self.next[self.prev[var as usize] as usize] = self.next[var as usize];
                 // Add a next link to the head
-                self.next[self.head] = var;
+                self.next[self.head as usize] = var;
                 // Make var the new head
-                self.prev[var] = self.head;
+                self.prev[var as usize] = self.head;
                 self.head = var;
             }
         }
@@ -343,12 +337,12 @@ impl Solver {
             // If checked before, return old result
             return (self.false_[lit] & MARK) != 0;
         }
-        if self.reason[lit.abs()] == 0 {
+        if self.reason[lit.abs() as usize] == 0 {
             // In case lit is a decision, it is not implied
             return false;
         }
         // Get the reason of lit(eral)
-        let mut p: Ptr<i32> = self.db + self.reason[lit.abs()] - 1;
+        let mut p: Ptr<i32> = self.db + (self.reason[lit.abs() as usize] as i32) - 1;
 
         // Iterate over literals in the reason
         while {
@@ -384,7 +378,7 @@ impl Solver {
         // as all resolution steps are done at current (conflict) level.
         'ext: while {
             self.assigned -= 1;
-            self.reason[(*self.assigned).abs()] != 0
+            self.reason[(*self.assigned).abs() as usize] != 0
         } {
             // If the tail of the stack is MARK
             if self.false_[*self.assigned] == MARK {
@@ -396,14 +390,14 @@ impl Solver {
                     check -= 1;
                     self.false_[*check] != MARK
                 } {
-                    if self.reason[(*check).abs()] == 0 {
+                    if self.reason[(*check).abs() as usize] == 0 {
                         // Otherwise it is the first-UIP so break
                         break 'ext;
                     }
                 }
 
                 // Get the reason and ignore first literal
-                clause = self.db + self.reason[(*self.assigned).abs()];
+                clause = self.db + self.reason[(*self.assigned).abs() as usize] as i32;
                 // MARK all literals in reason
                 while *clause != 0 {
                     self.bump(*clause);
@@ -430,7 +424,7 @@ impl Solver {
                 size += 1;
                 flag = 1;
             }
-            if self.reason[(*p).abs()] == 0 {
+            if self.reason[(*p).abs() as usize] == 0 {
                 // Increase LBD for a decision with a true flag
                 lbd += flag;
                 flag = 0;
@@ -469,7 +463,7 @@ impl Solver {
     unsafe fn propagate(&mut self) -> bool {
         // TODO: use a boolean…
         // Initialize forced flag
-        let mut forced = self.reason[(*self.processed).abs()];
+        let mut forced = self.reason[(*self.processed).abs() as usize];
 
         // Loop while there are unprocessed false literals
         while self.processed < self.assigned {
@@ -591,8 +585,8 @@ impl Solver {
 
             // As long as the temporay decision is assigned,
             // replace it with the next variable in the decision list
-            while self.false_[decision] != 0 || self.false_[-decision] != 0 {
-                decision = self.prev[decision];
+            while self.false_[decision] != 0 || self.false_[-(decision as i32)] != 0 {
+                decision = self.prev[decision as usize];
             }
 
             if decision == 0 {
@@ -613,7 +607,7 @@ impl Solver {
                 self.assigned += 1;
                 // Set the reason to 0 (no clause)
                 decision = decision.abs();
-                self.reason[decision] = 0;
+                self.reason[decision as usize] = 0;
             }
         }
     }
@@ -643,10 +637,10 @@ impl Solver {
             fast: 1 << 24,
             slow: 1 << 24,
             model: vec![],
-            next: Ptr::null(),
-            prev: Ptr::null(),
+            next: vec![],
+            prev: vec![],
             buffer: Ptr::null(),
-            reason: Ptr::null(),
+            reason: vec![],
             false_stack: Ptr::null(),
             forced: Ptr::null(),
             processed: Ptr::null(),
@@ -656,13 +650,12 @@ impl Solver {
             head: n_vars,
         };
         let n = n_vars as usize;
-        s.mem_used += n + 1; // emulate get_memory
         s.model = Vec::with_capacity(n + 1);
         s.model.resize(n + 1, false);
-        s.next = s.get_memory(n + 1);
-        s.prev = s.get_memory(n + 1);
+        s.next.resize(n + 1, 0);
+        s.prev.resize(n + 1, 0);
         s.buffer = s.get_memory(n);
-        s.reason = s.get_memory(n + 1);
+        s.reason.resize(n + 1, 0);
         s.false_stack = s.get_memory(n + 1);
         s.forced = s.false_stack;
         s.processed = s.false_stack;
@@ -676,8 +669,8 @@ impl Solver {
         // Initialize the main datastructures:
         for i in 1..=(n as i32) {
             // the double-linked list for variable-move-to-front
-            s.prev[i] = i - 1;
-            s.next[i - 1] = i;
+            s.prev[i as usize] = i - 1;
+            s.next[(i - 1) as usize] = i;
             // the false array
             s.false_[-i] = 0;
             s.false_[i] = 0;
@@ -693,6 +686,14 @@ impl Solver {
     /// Create a new solver for the given number of variables and clauses.
     pub fn new(n_vars: i32, n_clauses: i32) -> Self {
         unsafe { Self::new_(n_vars, n_clauses) }
+    }
+}
+
+impl Drop for Solver {
+    fn drop(&mut self) {
+        unsafe {
+            self.db.free(self.mem_max);
+        }
     }
 }
 
@@ -771,7 +772,7 @@ fn main() {
     }
 
     println!(
-        "c statistics of {}: mem: {} conflicts: {} max_lemmas: {}",
-        filename, s.mem_used, s.n_conflicts, s.max_lemmas
+        "c statistics of {}: conflicts: {} max_lemmas: {}",
+        filename, s.n_conflicts, s.max_lemmas
     );
 }
