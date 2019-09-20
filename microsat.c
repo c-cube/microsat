@@ -255,4 +255,4 @@ int main (int argc, char** argv) {			               // The main procedure for a 
   if      (parse (&S, argv[1]) == UNSAT) printf("s UNSATISFIABLE\n");  // Parse the DIMACS file in argv[1]
   else if (solve (&S)          == UNSAT) printf("s UNSATISFIABLE\n");  // Solve without limit (number of conflicts)
   else                                   printf("s SATISFIABLE\n")  ;  // And print whether the formula has a solution
-  printf ("c statistics of %s: mem: %i conflicts: %i max_lemmas: %i\n", argv[1], S.mem_used, S.nConflicts, S.maxLemmas); }
+  printf ("c statistics of %s: conflicts: %i max_lemmas: %i\n", argv[1], S.nConflicts, S.maxLemmas); }

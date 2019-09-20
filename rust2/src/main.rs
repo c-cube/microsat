@@ -695,6 +695,14 @@ impl Solver {
     }
 }
 
+impl Drop for Solver {
+    fn drop(&mut self) {
+        unsafe {
+            self.db.free(self.mem_max);
+        }
+    }
+}
+
 /// Parse the formula and initialize the solver. Returns SAT or UNSAT as well.
 fn parse(filename: &str) -> (Solver, bool) {
     use std::{fs::File, io, io::BufRead};
@@ -770,7 +778,7 @@ fn main() {
     }
 
     println!(
-        "c statistics of {}: mem: {} conflicts: {} max_lemmas: {}",
-        filename, s.mem_used, s.n_conflicts, s.max_lemmas
+        "c statistics of {}: conflicts: {} max_lemmas: {}",
+        filename, s.n_conflicts, s.max_lemmas
     );
 }
