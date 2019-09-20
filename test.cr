@@ -5,6 +5,7 @@ require "json"
 class Solver
   include JSON::Serializable
 
+  getter name : String
   def initialize(@name : String, @cmd : String, @sat : Regex, @unsat : Regex)
   end
 
@@ -16,18 +17,18 @@ class Solver
 
   delegate to_s, inspect, to: @name
 
-  def run(file, timeout : Int32? = nil, &block : Status -> _)
+  def run(file, timeout : Int32? = nil, &block : Status, String -> _)
     timeout = timeout || 10
     cmd = @cmd.gsub("{file}", file)
     cmd = "ulimit -t #{timeout}; exec #{cmd}"
     # run command, capture output in `s`
     s : String = String.build { |io| Process.run(cmd, shell: true, output: io) }
     if s.match(@sat)
-      yield Status::SAT
+      yield Status::SAT, s
     elsif s.match(@unsat)
-      yield Status::UNSAT
+      yield Status::UNSAT, s
     else
-      yield Status::UNKNOWN
+      yield Status::UNKNOWN, s
     end
   end
 
@@ -35,6 +36,7 @@ class Solver
     [
       Solver.new("minisat", cmd: "minisat {file}", sat: /^SATISFIABLE/m, unsat: /^UNSATISFIABLE/m),
       Solver.new("microsat-rs", cmd: "./microsat-rs {file}", sat: /^s SATISFIABLE/m, unsat: /^s UNSATISFIABLE/m),
+      Solver.new("microsat-rs2", cmd: "./microsat-rs2 {file}", sat: /^s SATISFIABLE/m, unsat: /^s UNSATISFIABLE/m),
       Solver.new("microsat-c", cmd: "./microsat-c {file}", sat: /^s SATISFIABLE/m, unsat: /^s UNSATISFIABLE/m),
     ]
   end
@@ -78,7 +80,8 @@ struct Time::Span
 end
 
 # result for running a given solver
-record Result, solver : Solver, filename : String, status : Status, time : Time::Span do
+record Result, solver : Solver, filename : String,
+  status : Status, time : Time::Span, last_line : String? do
   include JSON::Serializable
 end
 
@@ -95,10 +98,11 @@ def run_on_dir(dir : String, chan : Channel(Message), semaphore, timeout : Int32
         semaphore.acquire do
           puts "process file #{file} with solver #{solver} (timeout #{timeout})"
           start = Time.monotonic
-          solver.run(file, timeout: timeout) do |status|
+          solver.run(file, timeout: timeout) do |status, raw_out|
             duration = Time.monotonic - start
             puts "file #{file} with solver #{solver}: #{status} in #{duration}"
-            chan.send(Result.new solver, filename: file, status: status, time: duration)
+            chan.send(Result.new solver, filename: file,
+                      status: status, time: duration, last_line: raw_out.lines[-1]?)
           end
         end
       end
@@ -132,7 +136,7 @@ def start
 
   all_res = [] of Result
   n_dirs = dirs.size # remaining dirs to process
-  results = Hash(String, Hash(Solver, Status)).new
+  results = Hash(String, Hash(Solver, Result)).new
   results_missing = 0
   loop do
     break if n_dirs == 0 && results_missing == 0 # all done
@@ -144,8 +148,8 @@ def start
     when Result
       all_res << m
       # update map
-      map = results.fetch(m.filename) { Hash(Solver, Status).new }
-      map[m.solver] = m.status
+      map = results.fetch(m.filename) { Hash(Solver, Result).new }
+      map[m.solver] = m
       results[m.filename] = map
       results_missing -= 1
       # puts "result #{m}"
@@ -154,8 +158,16 @@ def start
 
   # find problems with conflicts
   results.each do |file, map|
-    if map.values.any? { |r| r == Status::SAT } && map.values.any? { |r| r == Status::UNSAT }
-      puts "conflict on #{file}: #{map.to_a.sort}"
+    if (map.values.any? {|r| r.status == Status::SAT } &&
+        map.values.any? {|r| r.status == Status::UNSAT })
+      puts "conflict on #{file}: #{map.to_a.sort_by{|x| x[1].solver} }"
+    end
+
+    # make sure all the microsat implementations have the exact same output
+    microsat_outs = map.values.select {|x|x.solver.name.starts_with? "microsat" }
+    if microsat_outs.each.map{|x| x.last_line}.to_set.size > 1
+      puts "microsat implems have distinct output for #{file}:"
+      microsat_outs.each { |x| puts "  #{x.solver.name}: #{x.last_line}" }
     end
   end
 
