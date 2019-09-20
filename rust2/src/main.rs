@@ -255,8 +255,9 @@ impl Solver {
     }
 
     /// Garbage collect lemmas.
+    ///
+    /// This removes "less useful" lemmas from DB.
     unsafe fn reduce_db(&mut self, k: usize) {
-        // Removes "less useful" lemmas from DB
         while self.n_lemmas > self.max_lemmas {
             self.max_lemmas += 300; // Allow more lemmas in the future
         }
@@ -266,16 +267,18 @@ impl Solver {
         let mut i = -self.n_vars;
         while i <= self.n_vars {
             if i == 0 {
+                i += 1;
                 continue;
             }
             // Get the pointer to the first watched clause
             let mut watch = self.first + i;
             while *watch != END {
                 if (*watch as usize) < self.mem_fixed {
-                    // Remove the watch if it points to a lemma
+                    // Go to next watch if it's an input clause
                     watch = self.db + *watch;
                 } else {
-                    // Otherwise (meaning an input clause) go to next watch
+                    // Otherwise, remove the watch if it points to a lemma,
+                    // we'll re-add it if we re-add the lemma.
                     *watch = self.db[*watch];
                 }
             }
@@ -572,13 +575,7 @@ impl Solver {
 
                 if self.fast > (self.slow / 100) * 125 {
                     // If fast average is substantially larger than slow average
-                    println!(
-                        "c restarting after {} conflicts ({} {}) {}",
-                        self.res,
-                        self.fast,
-                        self.slow,
-                        self.n_lemmas > self.max_lemmas
-                    );
+                    // println!( "c restarting after {} conflicts ({} {}) {}", self.res, self.fast, self.slow, self.n_lemmas > self.max_lemmas);
 
                     // Restart and update the averages
                     self.res = 0;
@@ -728,7 +725,7 @@ fn parse(filename: &str) -> (Solver, bool) {
         panic!("did not find the `p cnf` line");
     };
     let mut solver = Solver::new(n_vars, n_clauses);
-    println!("c problem has {} vars, {} clauses", n_vars, n_clauses);
+    //println!("c problem has {} vars, {} clauses", n_vars, n_clauses);
     let mut lits = Vec::with_capacity(n_vars as usize);
     // parse clauses from the rest of the lines
     for line in iter {
