@@ -26,11 +26,12 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
-enum { END = -9, UNSAT = 0, SAT = 1, MARK = 2, IMPLIED = 6 };
+enum { END = -9, UNSAT = 0, SAT = 1, MARK = 2, IMPLIED = 6, MEM_MAX = (1 << 30) };
 
 struct solver { // The variables in the struct are described in the allocate procedure
-  int  *DB, nVars, nClauses, mem_used, mem_fixed, mem_max, maxLemmas, nLemmas, *buffer, nConflicts, *model,
+  int  *DB, nVars, nClauses, mem_used, mem_fixed, maxLemmas, nLemmas, *buffer, nConflicts, *model,
        *reason, *falseStack, *false, *first, *forced, *processed, *assigned, *next, *prev, head, res, fast, slow; };
 
 void unassign (struct solver* S, int lit) { S->false[lit] = 0; }   // Unassign the literal
@@ -50,8 +51,8 @@ void addWatch (struct solver* S, int lit, int mem) {               // Add a watc
   S->DB[mem] = S->first[lit]; S->first[lit] = mem; }               // By updating the database and the pointers
 
 int* getMemory (struct solver* S, int mem_size) {                  // Allocate memory of size mem_size
-  if (S->mem_used + mem_size > S->mem_max) {                       // In case the code is used within a code base
-    printf ("c out of memory\n"); exit (0); }
+  if (S->mem_used > MEM_MAX - mem_size) {                          // In case the code is used within a code base
+    printf ("c out of memory\n"); exit (1); }
   int *store = (S->DB + S->mem_used);                              // Compute a pointer to the new memory location
   S->mem_used += mem_size;                                         // Update the size of the used memory
   return store; }                                                  // Return the pointer
@@ -182,14 +183,13 @@ void initCDCL (struct solver* S, int n, int m) {
   if (n < 1)      n = 1;                  // The code assumes that there is at least one variable
   S->nVars          = n;                  // Set the number of variables
   S->nClauses       = m;                  // Set the number of clauases
-  S->mem_max        = 1 << 30;            // Set the initial maximum memory
   S->mem_used       = 0;                  // The number of integers allocated in the DB
   S->nLemmas        = 0;                  // The number of learned clauses -- redundant means learned
   S->nConflicts     = 0;                  // Under of conflicts which is used to updates scores
   S->maxLemmas      = 2000;               // Initial maximum number of learnt clauses
   S->fast = S->slow = 1 << 24;            // Initialize the fast and slow moving averages
 
-  S->DB = (int *) malloc (sizeof (int) * S->mem_max); // Allocate the initial database
+  S->DB = (int *) malloc (sizeof (int) * MEM_MAX); // Allocate the initial database
   S->model       = getMemory (S, n+1); // Full assignment of the (Boolean) variables (initially set to false)
   S->next        = getMemory (S, n+1); // Next variable in the heuristic order
   S->prev        = getMemory (S, n+1); // Previous variable in the heuristic order
@@ -209,15 +209,33 @@ void initCDCL (struct solver* S, int n, int m) {
     S->first[i] = S->first[-i] = END; }                    // and first (watch pointers).
   S->head = n; }                                           // Initialize the head of the double-linked list
 
+static void read_until_new_line (FILE * input) {
+  int ch;
+  while ((ch = getc (input)) != '\n')
+    if (ch == EOF) { printf ("parse error: unexpected EOF"); exit (1); }
+}
+
 int parse (struct solver* S, char* filename) {                            // Parse the formula and initialize
-  int tmp; FILE* input = fopen (filename, "r");                           // Read the CNF file
-  do { tmp = fscanf (input, " p cnf %i %i \n", &S->nVars, &S->nClauses);  // Find the first non-comment line
+  int tmp; FILE* input; int close = 1;
+  if (strcmp (filename + strlen (filename) - 3, ".xz"))
+    input = fopen (filename, "r");					  // Open file
+  else { char * cmd = malloc (strlen (filename) + 20);
+    sprintf (cmd, "xz -c -d %s", filename);
+    input = popen (cmd, "r"); close = 2; free (cmd); }		          // Open pipe
+  while ((tmp = getc (input)) == 'c')
+    read_until_new_line (input);
+  ungetc (tmp, input);
+  do { tmp = fscanf (input, "p cnf %d %d", &S->nVars, &S->nClauses);  // Find the first non-comment line
     if (tmp > 0 && tmp != EOF) break; tmp = fscanf (input, "%*s\n"); }    // In case a commment line was found
   while (tmp != 2 && tmp != EOF);                                         // Skip it and read next line
 
   initCDCL (S, S->nVars, S->nClauses);                     // Allocate the main datastructures
   int nZeros = S->nClauses, size = 0;                      // Initialize the number of clauses to read
   while (nZeros > 0) {                                     // While there are clauses in the file
+    int ch = getc (input);
+    if (ch == ' ' || ch == '\n') continue;
+    if (ch == 'c') { read_until_new_line (input); continue; }
+    ungetc (ch, input);
     int lit = 0; tmp = fscanf (input, " %i ", &lit);       // Read a literal.
     if (!lit) {                                            // If reaching the end of the clause
       int* clause = addClause (S, S->buffer, size, 1);     // Then add the clause to data_base
@@ -227,10 +245,12 @@ int parse (struct solver* S, char* filename) {                            // Par
         assign (S, clause, 1); }                           // Directly assign new units (forced = 1)
       size = 0; --nZeros; }                                // Reset buffer
     else S->buffer[size++] = lit; }                        // Add literal to buffer
-  fclose (input);                                          // Close the formula file
+  if (close == 1) fclose (input);                          // Close the formula file
+  if (close == 2) pclose (input);                          // Close the formula pipe
   return SAT; }                                            // Return that no conflict was observed
 
 int main (int argc, char** argv) {			               // The main procedure for a STANDALONE solver
+  if (argc < 2) abort ();
   struct solver S;	                                               // Create the solver datastructure
   if      (parse (&S, argv[1]) == UNSAT) printf("s UNSATISFIABLE\n");  // Parse the DIMACS file in argv[1]
   else if (solve (&S)          == UNSAT) printf("s UNSATISFIABLE\n");  // Solve without limit (number of conflicts)
