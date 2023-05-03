@@ -30,6 +30,7 @@
 enum { END = -9, UNSAT = 0, SAT = 1, MARK = 2, IMPLIED = 6 };
 
 struct solver { // The variables in the struct are described in the initCDCL procedure
+  FILE* proof;
   int  *DB, nVars, nClauses, mem_used, mem_fixed, mem_max, maxLemmas, nLemmas, *buffer, nConflicts, *model,
        *reason, *falseStack, *false, *first, *forced, *processed, *assigned, *next, *prev, head, res, fast, slow; };
 
@@ -62,7 +63,12 @@ int* addClause (struct solver* S, int* in, int size, int irr) {    // Adds a cla
   if (size >  1) { addWatch (S, in[0], used  );                    // If the clause is not unit, then add
                    addWatch (S, in[1], used+1); }                  // Two watch pointers to the datastructure
   for (i = 0; i < size; i++) clause[i] = in[i]; clause[i] = 0;     // Copy the clause from the buffer to the database
-  if (irr) S->mem_fixed = S->mem_used; else S->nLemmas++;          // Update the statistics
+  if (irr) S->mem_fixed = S->mem_used; else {
+    for (i=0;i<size;++i)
+      fprintf(S->proof, "%d ", in[i]);
+    fprintf(S->proof, "0\n");
+    S->nLemmas++;          // Update the statistics
+  }
   return clause; }                                                 // Return the pointer to the clause in the database
 
 void reduceDB (struct solver* S, int k) {                     // Removes "less useful" lemmas from DB
@@ -161,7 +167,11 @@ int solve (struct solver* S) {                                      // Determine
   int decision = S->head; S->res = 0;                               // Initialize the solver
   for (;;) {                                                        // Main solve loop
     int old_nLemmas = S->nLemmas;                                   // Store nLemmas to see whether propagate adds lemmas
-    if (propagate (S) == UNSAT) return UNSAT;                       // Propagation returns UNSAT for a root level conflict
+    if (propagate (S) == UNSAT) {
+      fprintf(S->proof, "0\n");
+      fflush(S->proof);
+      return UNSAT;                       // Propagation returns UNSAT for a root level conflict
+    }
 
     if (S->nLemmas > old_nLemmas) {                                 // If the last decision caused a conflict
       decision = S->head;                                           // Reset the decision heuristic to head
@@ -202,6 +212,7 @@ void initCDCL (struct solver* S, int n, int m) {
   S->false       = getMemory (S, 2*n+1); S->false += n; // Labels for variables, non-zero means false
   S->first       = getMemory (S, 2*n+1); S->first += n; // Offset of the first watched clause
   S->DB[S->mem_used++] = 0;            // Make sure there is a 0 before the clauses are loaded.
+  S->proof = fopen("proof.drat", "w");
 
   int i; for (i = 1; i <= n; i++) {                        // Initialize the main datastructures:
     S->prev [i] = i - 1; S->next[i-1] = i;                 // the double-linked list for variable-move-to-front,
